@@ -31,6 +31,7 @@
 #include <limits>
 #include <unordered_map>
 #include <Corrade/Containers/GrowableArray.h>
+#include <Corrade/Containers/ArrayTuple.h>
 #include <Corrade/Containers/ArrayView.h>
 #include <Corrade/Containers/ArrayViewStl.h>
 #include <Corrade/Containers/Optional.h>
@@ -205,6 +206,7 @@ struct TinyGltfImporter::Document {
     std::vector<std::pair<std::size_t, std::size_t>> meshMap;
     std::vector<std::size_t> meshSizeOffsets;
 
+    // TODO rework this as we have multi-mesh support now
     /* Mapping for nodes having multi-primitive nodes. The same as above, but
        for nodes. Hierarchy-wise, the subsequent nodes are direct children of
        the first, have no transformation or other children and point to the
@@ -346,6 +348,7 @@ void TinyGltfImporter::doOpenData(const Containers::ArrayView<const char> data) 
         _d->meshSizeOffsets.emplace_back(_d->meshMap.size());
     }
 
+    // TODO rework
     /* In order to support multi-primitive meshes, we need to duplicate the
        nodes as well */
     _d->nodeSizeOffsets.emplace_back(0);
@@ -921,27 +924,295 @@ std::string TinyGltfImporter::doSceneName(const UnsignedInt id) {
 Containers::Optional<SceneData> TinyGltfImporter::doScene(UnsignedInt id) {
     const tinygltf::Scene& scene = _d->model.scenes[id];
 
-    /* The scene contains always the top-level nodes, all multi-primitive mesh
-       nodes are children of them */
-    std::vector<UnsignedInt> children;
-    children.reserve(scene.nodes.size());
-    for(const Int i: scene.nodes) {
-        if(UnsignedInt(i) >= _d->model.nodes.size()) {
-            Error{} << "Trade::TinyGltfImporter::scene(): node index" << i << "out of bounds for" << _d->model.nodes.size() << "nodes";
-            return Containers::NullOpt;
+    /* Gather all top-level nodes belonging to a scene and recursively populate
+       the children ranges. Optimistically assume the glTF has just a single
+       scene and reserve for that. We still need a separate allocation for the
+       final ArrayTuple anyway so the extra allocations are fine, and the
+       children range array is only temporary. */
+    Containers::Array<UnsignedInt> objects;
+    arrayReserve(objects, _d->model.nodes.size());
+    Containers::Array<Range1Dui> children;
+    arrayReserve(objects, _d->model.nodes.size() + 1);
+    arrayAppend(children, InPlaceInit, 0, scene.nodes.size());
+    for(const UnsignedInt i: scene.nodes) {
+        if(i >= _d->model.nodes.size()) {
+            Error{} << "Trade::TinyGltfImporter::scene(): scene node index" << i << "out of bounds for" << _d->model.nodes.size() << "nodes";
+            return {};
         }
 
-        children.push_back(_d->nodeSizeOffsets[i]);
+        arrayAppend(objects, i);
+    }
+    for(std::size_t i = 0; i != children.size(); ++i) {
+        const Range1Dui nodeRangeToProcess = children[i];
+        for(std::size_t j = nodeRangeToProcess.min(); j != nodeRangeToProcess.max(); ++j) {
+            arrayAppend(children, InPlaceInit, objects.size(), objects.size() + _d->model.nodes[j].children.size());
+            for(const UnsignedInt k: _d->model.nodes[j].children) {
+                if(i >= _d->model.nodes.size()) {
+                    Error{} << "Trade::TinyGltfImporter::scene(): node" << j << "child index" << k << "out of bounds for" << _d->model.nodes.size() << "nodes";
+                    return {};
+                }
+
+                arrayAppend(objects, k);
+            }
+        }
     }
 
-    return SceneData{{}, std::move(children), &scene};
-}
+    /* Count how many objects have matrices, how many have separate TRS
+       properties and which of the set are present. Then also gather mesh,
+       light, camera and skin assignment count. Materials have to use the same
+       object mapping as meshes, so only check if there's any material
+       assignment at all -- if not, then we won't need to store that field. */
+    UnsignedInt transformationCount = 0;
+    UnsignedInt trsCount = 0;
+    bool hasTranslations = false;
+    bool hasRotations = false;
+    bool hasScalings = false;
+    UnsignedInt meshCount = 0;
+    bool hasMeshMaterials = false;
+    UnsignedInt lightCount = 0;
+    UnsignedInt cameraCount = 0;
+    UnsignedInt skinCount = 0;
+    for(const UnsignedInt i: objects) {
+        const tinygltf::Node& node = _d->model.nodes[i];
+        if(node.matrix.size() != 0) ++transformationCount;
+        if(node.translation.size() != 0 ||
+           node.rotation.size() != 0 ||
+           node.scale.size() != 0) ++trsCount;
+        if(node.translation.size() != 0) hasTranslations = true;
+        if(node.rotation.size() != 0) hasRotations = true;
+        if(node.scale.size() != 0) hasScalings = true;
+        if(node.mesh != -1) {
+            ++meshCount;
+            // TODO materials, from multi-primitive meshes as well
+        }
+        if(node.camera != -1) ++cameraCount;
+        if(node.skin != -1) ++skinCount;
+        if(node.extensions.find("KHR_lights_punctual") != node.extensions.end()) {
+            ++lightCount;
+        }
+    }
 
-UnsignedInt TinyGltfImporter::doObject3DCount() const {
-    return _d->nodeMap.size();
+    /* If all objects have TRS, no need to store the combined transform field */
+    // TODO what if not all have TRS but also none have matrices? that could be
+    //  TRS-only as well, but with trs count being all objects
+    if(trsCount == objects.size()) {
+        transformationCount = 0;
+    /* If there's neither TRS nor the combined transform for any object, no
+       need to store anything. If however just some objects have a transform,
+       store it for all. The TRS components can be just for some objects,
+       that's fine. */
+    } else if(transformationCount != 0 || trsCount != 0) {
+        transformationCount = objects.size();
+    }
+
+    /* Allocate the output array */
+    Containers::ArrayView<UnsignedInt> transformationParentObjects;
+    Containers::ArrayView<Int> parents;
+    Containers::ArrayView<Matrix4> transformations;
+    Containers::ArrayView<UnsignedInt> trsObjects;
+    Containers::ArrayView<Vector3> translations;
+    Containers::ArrayView<Quaternion> rotations;
+    Containers::ArrayView<Vector3> scalings;
+    Containers::ArrayView<UnsignedInt> meshMaterialObjects;
+    Containers::ArrayView<UnsignedInt> meshes;
+    Containers::ArrayView<UnsignedInt> meshMaterials;
+    Containers::ArrayView<UnsignedInt> lightObjects;
+    Containers::ArrayView<UnsignedInt> lights;
+    Containers::ArrayView<UnsignedInt> cameraObjects;
+    Containers::ArrayView<UnsignedInt> cameras;
+    Containers::ArrayView<UnsignedInt> skinObjects;
+    Containers::ArrayView<UnsignedInt> skins;
+    Containers::Array<char> data = Containers::ArrayTuple{
+        {NoInit, objects.size(), transformationParentObjects},
+        {NoInit, objects.size(), parents},
+        {NoInit, transformationCount, transformations},
+        {NoInit, trsCount, trsObjects},
+        {NoInit, hasTranslations ? trsCount : 0, translations},
+        {NoInit, hasRotations ? trsCount : 0, rotations},
+        {NoInit, hasScalings ? trsCount : 0, rotations},
+        {NoInit, meshCount, meshMaterialObjects},
+        {NoInit, meshCount, meshes},
+        {NoInit, hasMeshMaterials ? meshCount : 0, meshMaterials},
+        {NoInit, lightCount, lightObjects},
+        {NoInit, lightCount, lights},
+        {NoInit, cameraCount, cameraObjects},
+        {NoInit, cameraCount, cameras},
+        {NoInit, skinCount, skinObjects},
+        {NoInit, skinCount, skins}
+    };
+
+    /* Populate object mapping for parents and transforms, synthesize parent
+       info from the child ranges */
+    Utility::copy(objects, transformationParentObjects);
+    for(std::size_t i = 0; i != children.size(); ++i) {
+        Int parent = Int(i) - 1;
+        for(std::size_t j = children[i].min(); j != children[i].max(); ++j)
+            parents[j] = parent;
+    }
+
+    /* Populate the rest */
+    std::size_t trsOffset = 0;
+    std::size_t meshMaterialOffset = 0;
+    std::size_t lightOffset = 0;
+    std::size_t cameraOffset = 0;
+    std::size_t skinOffset = 0;
+    for(std::size_t i = 0; i != objects.size(); ++i) {
+        const tinygltf::Node& node = _d->model.nodes[i];
+
+        /* Populate TRS information */
+        Vector3 translation;
+        if(node.translation.size() != 0) {
+            CORRADE_INTERNAL_ASSERT(node.translation.size() == 3);
+            translations[trsOffset] = translation = Vector3{Vector3d::from(node.translation.data())};
+        }
+
+        Quaternion rotation;
+        if(node.rotation.size() != 0) {
+            CORRADE_INTERNAL_ASSERT(node.rotation.size() == 4);
+            rotations[trsOffset] = rotation = Quaternion{Vector3{Vector3d::from(node.rotation.data())}, Float(node.rotation[3])};
+        }
+
+        Vector3 scaling{1.0f};
+        if(node.scale.size() != 0) {
+            CORRADE_INTERNAL_ASSERT(node.scale.size() == 3);
+            scalings[trsOffset] = scaling = Vector3{Vector3d::from(node.scale.data())};
+        }
+
+        /* Store the TRS object mapping and increase the offset only if there
+           was something */
+        if(node.translation.size() != 0 ||
+           node.rotation.size() != 0 ||
+           node.scale.size() != 0)
+        {
+            trsObjects[trsOffset] = objects[i];
+            ++trsOffset;
+        }
+
+        /* Populate the combined transformation only if we actually want
+           to store it */
+        if(transformationCount) {
+            Matrix4 transformation;
+            if(node.matrix.size() != 0) {
+                CORRADE_INTERNAL_ASSERT(node.matrix.size() == 4);
+                transformation = Matrix4{Matrix4d::from(node.matrix.data())};
+
+            /* If not present directly, compose it from TRS components. If
+               those were not present either, this will be an identity. For
+               simplicity do the compose in that case as well, adding
+               another branch won't make much difference in speed of scene
+               data import, JSON is the bottleneck in the first place. */
+            } else {
+                transformation =
+                    Matrix4::translation(translation)*
+                    Matrix4{rotation.toMatrix()}*
+                    Matrix4::scaling(scaling);
+            }
+
+            transformations[i] = transformation;
+        }
+
+        /* Populate mesh references */
+        if(node.mesh != -1) {
+            if(UnsignedInt(node.mesh) >= _d->model.meshes.size()) {
+                Error{} << "Trade::TinyGltfImporter::scene(): mesh index" << node.mesh << "in node" << i << "out of bounds for" << _d->model.meshes.size() << "meshes";
+                return {};
+            }
+
+            meshMaterialObjects[meshMaterialOffset] = objects[i];
+            meshes[meshMaterialOffset] = node.mesh;
+            // TODO materials
+            ++meshMaterialOffset;
+        }
+
+        /* Populate light references */
+        if(node.extensions.find("KHR_lights_punctual") != node.extensions.end()) {
+            const UnsignedInt light = node.extensions.at("KHR_lights_punctual").Get("light").Get<int>();
+
+            if(light >= _d->model.lights.size()) {
+                Error{} << "Trade::TinyGltfImporter::scene(): light index" << light << "in node" << i << "out of bounds for" << _d->model.lights.size() << "lights";
+                return {};
+            }
+
+            lightObjects[lightOffset] = objects[i];
+            lights[lightOffset] = node.camera;
+            ++lightOffset;
+        }
+
+        /* Populate camera references */
+        if(node.camera != -1) {
+            if(UnsignedInt(node.camera) >= _d->model.cameras.size()) {
+                Error{} << "Trade::TinyGltfImporter::scene(): camera index" << node.camera << "in node" << i << "out of bounds for" << _d->model.cameras.size() << "cameras";
+                return {};
+            }
+
+            cameraObjects[cameraOffset] = objects[i];
+            cameras[cameraOffset] = node.camera;
+            ++cameraOffset;
+        }
+
+        /* Populate skin references */
+        if(node.skin != -1) {
+            if(UnsignedInt(node.skin) >= _d->model.skins.size()) {
+                Error{} << "Trade::TinyGltfImporter::scene(): skin index" << node.skin << "in node" << i << "out of bounds for" << _d->model.skins.size() << "skins";
+                return {};
+            }
+
+            skinObjects[skinOffset] = objects[i];
+            skins[skinOffset] = node.skin;
+            ++skinOffset;
+        }
+    }
+
+    CORRADE_INTERNAL_ASSERT(
+        trsOffset = trsObjects.size() &&
+        meshMaterialOffset == meshMaterialObjects.size() &&
+        lightOffset == lightObjects.size() &&
+        cameraOffset == cameraObjects.size() &&
+        skinOffset == skinObjects.size());
+
+    /* Put everything together */
+    Containers::Array<SceneFieldData> fields;
+    // TODO omit parents if all are -1
+    arrayAppend(fields, SceneFieldData{
+        SceneField::Parent, transformationParentObjects, parents
+    });
+    if(transformationCount) arrayAppend(fields, SceneFieldData{
+        SceneField::Transformation, transformationParentObjects, transformations
+    });
+    if(hasTranslations) arrayAppend(fields, SceneFieldData{
+        SceneField::Translation, trsObjects, translations
+    });
+    if(hasRotations) arrayAppend(fields, SceneFieldData{
+        SceneField::Rotation, trsObjects, rotations
+    });
+    if(hasScalings) arrayAppend(fields, SceneFieldData{
+        SceneField::Scaling, trsObjects, scalings
+    });
+    if(meshCount) arrayAppend(fields, SceneFieldData{
+        SceneField::Mesh, meshMaterialObjects, meshes
+    });
+    if(hasMeshMaterials) arrayAppend(fields, SceneFieldData{
+        SceneField::MeshMaterial, meshMaterialObjects, meshMaterials
+    });
+    if(lightCount) arrayAppend(fields, SceneFieldData{
+        SceneField::Light, lightObjects, lights
+    });
+    if(cameraCount) arrayAppend(fields, SceneFieldData{
+        SceneField::Camera, cameraObjects, cameras
+    });
+    if(skinCount) arrayAppend(fields, SceneFieldData{
+        SceneField::Skin, skinObjects, skins
+    });
+
+    /* Convert back to the default deleter to avoid dangling deleter function
+       pointer issues when unloading the plugin */
+    arrayShrink(fields);
+    // TODO ugh how do i actually number the objects for a scene???
+    return SceneData{SceneObjectType::UnsignedInt, _d->model.nodes.size(), std::move(data), std::move(fields), &scene};
 }
 
 Int TinyGltfImporter::doObject3DForName(const std::string& name) {
+    // TODO how to express in the new API?
     if(!_d->nodesForName) {
         _d->nodesForName.emplace();
         _d->nodesForName->reserve(_d->model.nodes.size());
@@ -957,143 +1228,9 @@ Int TinyGltfImporter::doObject3DForName(const std::string& name) {
 }
 
 std::string TinyGltfImporter::doObject3DName(UnsignedInt id) {
+    // TODO how to express in the new API?
     /* This returns the same name for all multi-primitive mesh node duplicates */
     return _d->model.nodes[_d->nodeMap[id].first].name;
-}
-
-Containers::Pointer<ObjectData3D> TinyGltfImporter::doObject3D(UnsignedInt id) {
-    const std::size_t originalNodeId = _d->nodeMap[id].first;
-    const std::size_t nodePrimitiveId = _d->nodeMap[id].second;
-    const tinygltf::Node& node = _d->model.nodes[originalNodeId];
-
-    /* Checks that are common for mesh nodes and extra nodes for
-       multi-primitive meshes */
-    if(nodePrimitiveId || node.mesh != -1) {
-        const Int materialId = _d->model.meshes[node.mesh].primitives[nodePrimitiveId].material;
-        if(materialId != -1 && UnsignedInt(materialId) >= _d->model.materials.size()) {
-            Error{} << "Trade::TinyGltfImporter::object3D(): material index" << materialId << "out of bounds for" << _d->model.materials.size() << "materials";
-            return nullptr;
-        }
-
-        if(node.skin != -1 && UnsignedInt(node.skin) >= _d->model.skins.size()) {
-            Error{} << "Trade::TinyGltfImporter::object3D(): skin index" << node.skin << "out of bounds for" << _d->model.skins.size() << "skins";
-            return nullptr;
-        }
-    }
-
-    /* This is an extra node added for multi-primitive meshes -- return it with
-       no children, identity transformation and just a link to the particular
-       mesh & material combo */
-    if(nodePrimitiveId) {
-        /* This had to be already checked during file import as we remap for
-           multi-primitive meshes */
-        CORRADE_INTERNAL_ASSERT(UnsignedInt(node.mesh) <= _d->model.meshes.size());
-
-        const UnsignedInt meshId = _d->meshSizeOffsets[node.mesh] + nodePrimitiveId;
-        const Int materialId = _d->model.meshes[node.mesh].primitives[nodePrimitiveId].material;
-        return Containers::pointer(new MeshObjectData3D{{}, {}, {}, Vector3{1.0f}, meshId, materialId, node.skin, &node});
-    }
-
-    CORRADE_INTERNAL_ASSERT(node.rotation.size() == 0 || node.rotation.size() == 4);
-    CORRADE_INTERNAL_ASSERT(node.translation.size() == 0 || node.translation.size() == 3);
-    CORRADE_INTERNAL_ASSERT(node.scale.size() == 0 || node.scale.size() == 3);
-    /* Ensure we have either a matrix or T-R-S */
-    CORRADE_INTERNAL_ASSERT(node.matrix.size() == 0 ||
-        (node.matrix.size() == 16 && node.translation.size() == 0 && node.rotation.size() == 0 && node.scale.size() == 0));
-
-    /* Node children: first add extra nodes caused by multi-primitive meshes,
-       after that the usual children. */
-    std::vector<UnsignedInt> children;
-    const std::size_t extraChildrenCount = _d->nodeSizeOffsets[originalNodeId + 1] - _d->nodeSizeOffsets[originalNodeId] - 1;
-    children.reserve(extraChildrenCount + node.children.size());
-    for(std::size_t i = 0; i != extraChildrenCount; ++i) {
-        /** @todo the test should fail with children.push_back(originalNodeId + i + 1); */
-        children.push_back(_d->nodeSizeOffsets[originalNodeId] + i + 1);
-    }
-    for(const Int i: node.children) {
-        if(UnsignedInt(i) >= _d->model.nodes.size()) {
-            Error{} << "Trade::TinyGltfImporter::object3D(): child index" << i << "out of bounds for" << _d->model.nodes.size() << "nodes";
-            return nullptr;
-        }
-
-        children.push_back(_d->nodeSizeOffsets[i]);
-    }
-
-    /* According to the spec, order is T-R-S: first scale, then rotate, then
-       translate (or translate*rotate*scale multiplication of matrices). Makes
-       most sense, since non-uniform scaling of rotated object is unwanted in
-       99% cases, similarly with rotating or scaling a translated object. Also
-       independently verified by exporting a model with translation, rotation
-       *and* scaling of hierarchic objects. */
-    ObjectFlags3D flags;
-    Matrix4 transformation;
-    Vector3 translation;
-    Quaternion rotation;
-    Vector3 scaling{1.0f};
-    if(node.matrix.size() == 16) {
-        transformation = Matrix4(Matrix4d::from(node.matrix.data()));
-    } else {
-        /* Having TRS is a better property than not having it, so we set this
-           flag even when there is no transformation at all. */
-        flags |= ObjectFlag3D::HasTranslationRotationScaling;
-        if(node.translation.size() == 3)
-            translation = Vector3{Vector3d::from(node.translation.data())};
-        if(node.rotation.size() == 4) {
-            rotation = Quaternion{Vector3{Vector3d::from(node.rotation.data())}, Float(node.rotation[3])};
-            if(!rotation.isNormalized() && configuration().value<bool>("normalizeQuaternions")) {
-                rotation = rotation.normalized();
-                Warning{} << "Trade::TinyGltfImporter::object3D(): rotation quaternion was renormalized";
-            }
-        }
-        if(node.scale.size() == 3)
-            scaling = Vector3{Vector3d::from(node.scale.data())};
-    }
-
-    /* Node is a mesh */
-    if(node.mesh != -1) {
-        /* This had to be already checked during file import as we remap for
-           multi-primitive meshes */
-        CORRADE_INTERNAL_ASSERT(UnsignedInt(node.mesh) <= _d->model.meshes.size());
-
-        /* Multi-primitive nodes are handled above */
-        CORRADE_INTERNAL_ASSERT(_d->nodeMap[id].second == 0);
-        CORRADE_INTERNAL_ASSERT(!_d->model.meshes[node.mesh].primitives.empty());
-
-        const UnsignedInt meshId = _d->meshSizeOffsets[node.mesh];
-        const Int materialId = _d->model.meshes[node.mesh].primitives[0].material;
-        return Containers::pointer(flags & ObjectFlag3D::HasTranslationRotationScaling ?
-            new MeshObjectData3D{std::move(children), translation, rotation, scaling, meshId, materialId, node.skin, &node} :
-            new MeshObjectData3D{std::move(children), transformation, meshId, materialId, node.skin, &node});
-    }
-
-    /* Unknown nodes are treated as Empty */
-    ObjectInstanceType3D instanceType = ObjectInstanceType3D::Empty;
-    UnsignedInt instanceId = ~UnsignedInt{}; /* -1 */
-
-    /* Node is a camera */
-    if(node.camera != -1) {
-        if(UnsignedInt(node.camera) >= _d->model.cameras.size()) {
-            Error{} << "Trade::TinyGltfImporter::object3D(): camera index" << node.camera << "out of bounds for" << _d->model.cameras.size() << "cameras";
-            return nullptr;
-        }
-
-        instanceType = ObjectInstanceType3D::Camera;
-        instanceId = node.camera;
-
-    /* Node is a light */
-    } else if(node.extensions.find("KHR_lights_punctual") != node.extensions.end()) {
-        instanceType = ObjectInstanceType3D::Light;
-        instanceId = UnsignedInt(node.extensions.at("KHR_lights_punctual").Get("light").Get<int>());
-
-        if(instanceId >= _d->model.lights.size()) {
-            Error{} << "Trade::TinyGltfImporter::object3D(): light index" << Int(instanceId) << "out of bounds for" << _d->model.lights.size() << "lights";
-            return nullptr;
-        }
-    }
-
-    return Containers::pointer(flags & ObjectFlag3D::HasTranslationRotationScaling ?
-        new ObjectData3D{std::move(children), translation, rotation, scaling, instanceType, instanceId, &node} :
-        new ObjectData3D{std::move(children), transformation, instanceType, instanceId, &node});
 }
 
 UnsignedInt TinyGltfImporter::doSkin3DCount() const {
